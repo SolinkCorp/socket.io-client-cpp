@@ -110,6 +110,7 @@ namespace sio
         m_http_headers = headers;
 
         this->reset_states();
+        m_abort_retries = false;
         m_client.get_io_service().dispatch(std::bind(&client_impl::connect_impl,this,uri,m_query_string));
         m_network_thread.reset(new thread(std::bind(&client_impl::run_loop,this)));//uri lifecycle?
 
@@ -148,6 +149,7 @@ namespace sio
     void client_impl::close()
     {
         m_con_state = con_closing;
+        m_abort_retries = true;
         this->sockets_invoke_void(&sio::socket::close);
         m_client.get_io_service().dispatch(std::bind(&client_impl::close_impl, this,close::status::normal,"End by user"));
     }
@@ -155,6 +157,7 @@ namespace sio
     void client_impl::sync_close()
     {
         m_con_state = con_closing;
+        m_abort_retries = true;
         this->sockets_invoke_void(&sio::socket::close);
         m_client.get_io_service().dispatch(std::bind(&client_impl::close_impl, this,close::status::normal,"End by user"));
         if(m_network_thread)
@@ -234,6 +237,7 @@ namespace sio
             ss<<"&t="<<time(NULL)<<queryString;
             lib::error_code ec;
             client_type::connection_ptr con = m_client.get_connection(ss.str(), ec);
+
             if (ec) {
                 m_client.get_alog().write(websocketpp::log::alevel::app,
                                           "Get Connection Error: "+ec.message());
@@ -377,11 +381,19 @@ namespace sio
 
     void client_impl::on_fail(connection_hdl)
     {
+        con_state m_con_state_was = m_con_state;
         m_con.reset();
         m_con_state = con_closed;
         this->sockets_invoke_void(&sio::socket::on_disconnect);
+
+        if (m_con_state_was == con_closing) {
+            LOG("Connection failed while closing." << endl);
+            this->close();
+            return;
+        }
+
         LOG("Connection failed." << endl);
-        if(m_reconn_made<m_reconn_attempts)
+        if(m_reconn_made<m_reconn_attempts && !m_abort_retries)
         {
             LOG("Reconnect for attempt:"<<m_reconn_made<<endl);
             unsigned delay = this->next_delay();
@@ -399,10 +411,18 @@ namespace sio
     
     void client_impl::on_open(connection_hdl con)
     {
+        con_state m_con_state_was = m_con_state;
         LOG("Connected." << endl);
         m_con_state = con_opened;
         m_con = con;
         m_reconn_made = 0;
+
+        if (m_con_state_was == con_closing) {
+            LOG("Connection opened while closing." << endl);
+            this->close();
+            return;
+        }
+
         this->sockets_invoke_void(&sio::socket::on_open);
         this->socket("");
         if(m_open_listener)m_open_listener();
@@ -439,7 +459,7 @@ namespace sio
         else
         {
             this->sockets_invoke_void(&sio::socket::on_disconnect);
-            if(m_reconn_made<m_reconn_attempts)
+            if(m_reconn_made<m_reconn_attempts && !m_abort_retries)
             {
                 LOG("Reconnect for attempt:"<<m_reconn_made<<endl);
                 unsigned delay = this->next_delay();
